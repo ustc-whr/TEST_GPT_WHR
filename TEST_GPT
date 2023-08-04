@@ -1,0 +1,203 @@
+import pandas as pd
+import torch
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+# Load the .pkl file
+data = pd.read_pickle('day.pkl')
+
+data['open']=data['open']/data['pre_close']-1
+data['close']=data['close']/data['pre_close']-1#close现在代表收益率
+data['high']=data['high']/data['pre_close']-1
+data['low']=data['low']/data['pre_close']-1
+data['money']=data['money'].pct_change()
+num_steps = 40
+y = torch.tensor(data['close'].values[num_steps+1:])
+data
+#%%
+split_idx = int(len(data) * 0.6)
+split_idx2 = int(len(data) * 0.8)
+data_train,data_test,data_whr= data[:split_idx], data[split_idx:split_idx2],data[split_idx2:]
+
+#对训练集，验证集，测试集标准化 test事实上是测试集 _whr的是测试集
+split_idx = int(len(data) * 0.6)
+split_idx2 = int(len(data) * 0.8)
+data_train, data_test, data_whr = data[:split_idx], data[split_idx:split_idx2], data[split_idx2:]
+#%%
+# Calculate mean and standard deviation for the training data
+mean_train = data_train.mean()
+std_train = data_train.std()
+
+# Standardize all datasets
+data_standardized_train = (data_train - mean_train) / std_train
+data_standardized_test = (data_test - mean_train) / std_train
+data_standardized_whr = (data_whr - mean_train) / std_train
+
+# Fill NaN values with 0
+data_standardized_train.fillna(0, inplace=True)
+data_standardized_test.fillna(0, inplace=True)
+data_standardized_whr.fillna(0, inplace=True)
+
+# Concatenate all datasets
+data_standardized = pd.concat([data_standardized_train, data_standardized_test, data_standardized_whr])
+data = data_standardized
+
+# Specify the number of steps
+X_np = np.array([data[i : i + num_steps].values.flatten() for i in range(len(data) - num_steps - 1)])
+X = torch.tensor(X_np)
+
+num_epochs=25
+batch_size=32
+num_hidden_layers=24
+alpha,beta=1,0
+lr=0.003
+std=0.2
+weight_decay=0.2
+dropout_rate=0.2
+do_shuffle=True
+
+
+# Split into training and test set
+split_idx = int(len(X) * 0.6)
+split_idx2 = int(len(X) * 0.8)
+X_train, X_test, X_whr = X[:split_idx], X[split_idx:split_idx2],X[split_idx2:]
+y_train, y_test, y_whr= y[:split_idx], y[split_idx:split_idx2],y[split_idx2:]
+#训练集和测试集
+
+# Create data loaders
+train_iter = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=do_shuffle)
+test_iter = DataLoader(TensorDataset(X_test, y_test), batch_size=batch_size)
+whr_iter =  DataLoader(TensorDataset(X_whr,y_whr),batch_size=batch_size)
+
+
+class GRUModel(torch.nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(GRUModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.rnn = torch.nn.GRU(input_size, hidden_size, num_layers=num_layers, batch_first=True)
+        self.fc = torch.nn.Linear(hidden_size, output_size)
+
+        for layer in self.rnn._all_weights:
+            for param_name in layer:
+                if 'weight' in param_name:
+                    torch.nn.init.normal_(self.rnn.__getattr__(param_name), mean=0, std=std)
+                else:  # Bias
+                    torch.nn.init.zeros_(self.rnn.__getattr__(param_name))
+
+        # Initialize the weights and biases of the fc layer
+        torch.nn.init.normal_(self.fc.weight, mean=0, std=std)
+        torch.nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x):
+        # h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        out, _ = self.rnn(x)
+        out = self.fc(out)
+        return out
+
+
+model = GRUModel(input_size=6 * num_steps, hidden_size=num_hidden_layers * num_steps, num_layers=2, output_size=1)
+
+
+
+def custom_loss(y_pred, y_true, alpha=alpha, beta=beta):  # hinge loss
+    mse = torch.nn.functional.mse_loss(y_pred, y_true)
+
+    sign_diff = torch.sign(y_pred) != torch.sign(y_true)
+    regularization = torch.mean(torch.abs(y_pred - y_true) * sign_diff.float())
+
+    return alpha * mse + beta * regularization
+
+
+optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+# Define device
+device = torch.device("cpu")
+
+# Move model to device
+model = model.to(device)
+
+# Place to store the loss values
+train_losses = []
+test_losses = []
+
+# Training loop
+for epoch in range(num_epochs):  # number of epochs
+    model.train()
+    train_loss = 0
+    for X_batch, y_batch in train_iter:
+        X_batch = X_batch.float().to(device)
+        y_batch = y_batch.float().to(device)
+
+        # Forward pass
+        y_pred = model(X_batch)
+
+        # Compute loss
+        # 我不知道为什么要unsqussze(-1),gpt说过要这样做
+        loss = custom_loss(y_pred, y_batch.unsqueeze(-1))
+
+        # Backward pass and optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+
+    train_loss /= len(train_iter)
+    train_losses.append(train_loss)
+
+    model.eval()
+    test_loss = 0
+    with torch.no_grad():
+        for X_batch, y_batch in test_iter:
+            X_batch = X_batch.float().to(device)
+            y_batch = y_batch.float().to(device)
+
+            y_pred_batch = model(X_batch)
+            loss = custom_loss(y_pred_batch, y_batch.unsqueeze(-1))
+            test_loss += loss.item()
+            # y_pred_val.append(y_pred_batch)
+
+    test_loss /= len(test_iter)
+    test_losses.append(test_loss)
+
+    print(f'Epoch {epoch + 1}, Train Loss: {train_loss}, Test Loss: {test_loss}')
+#%%
+
+def evaluate_model_on_train_set(model, train_iter, device):
+    model.eval()
+    outputs = []
+    labels = []
+    with torch.no_grad():
+        for X_batch, y_batch in train_iter:
+            X_batch = X_batch.float().to(device)
+            y_batch = y_batch.float().to(device)
+
+            # Get model predictions
+            y_pred_batch = model(X_batch)
+
+            # Save the outputs and labels
+            outputs.extend(y_pred_batch.squeeze(-1).cpu().numpy())
+            labels.extend(y_batch.cpu().numpy())
+
+    return outputs, labels
+
+
+# Now, let's evaluate the model on the training set
+outputs, labels = evaluate_model_on_train_set(model, train_iter, device)
+
+# Then, we will create a dataframe to store the outputs and labels
+df_results = pd.DataFrame({'predicted': outputs, 'label': labels})
+
+df_results
+#%%
+print(df_results.shape)
+a=np.array(df_results['predicted']*df_results['label'])
+print(len(a[a>=0])/len(a))
+
+plt.figure(figsize=(14, 7))
+plt.plot(df_results['label'], label='label')
+plt.plot(df_results['predicted'], label='predicted')
+plt.legend()
+plt.title('Actual vs Predicted Return on Test Set')
+plt.show()
